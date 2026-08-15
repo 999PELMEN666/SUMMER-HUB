@@ -34,6 +34,12 @@ _G.SH = { conns = {}, state = {}, skins = {} }
 local SH = _G.SH
 local function conn(c) table.insert(SH.conns, c) return c end
 
+-- forward decls (used before full definition)
+local applyTheme, hardRefresh, applyWorld
+local repaint, themePaintFns, pages, tabBtns
+repaint, themePaintFns = {}, {}
+pages, tabBtns = {}, {}
+
 -- ================= UID =================
 -- UID: sequential starting at 1. Bot API optional.
 -- BOT_UID_URL should return JSON: {"max":12} or {"next":13} or {"banned":["3","5"]}
@@ -89,7 +95,8 @@ local function getOrCreateUID()
         pcall(function()
             local base = BOT_UID_URL:gsub("/+$", "")
             local u = base:find("/uid") and base:gsub("/next","/register"):gsub("/max","/register") or (base .. "/uid/register")
-            game:HttpGet(u .. "?uid=" .. uid .. "&user=" .. tostring(LP.UserId))
+            local uname = tostring(LP.DisplayName or LP.Name or LP.UserId)
+            game:HttpGet(u .. "?uid=" .. uid .. "&user=" .. HttpService:UrlEncode(uname))
         end)
     end
     return uid
@@ -196,6 +203,7 @@ local S = {
     wmOn=true, wmStyle=1,
     wmShowFPS=true, wmShowPing=true, wmShowName=true, wmShowTime=true, wmImage="",
     menuKey=Enum.KeyCode.End, hideKey=Enum.KeyCode.RightShift,
+    slotRGB=true, gunHUDRGB=true,
 }
 SH.state = S
 
@@ -205,12 +213,18 @@ local texBackup = {}
 
 local function armName(n)
     n = string.lower(n or "")
-    return n:find("arm",1,true) or n:find("hand",1,true) or n:find("glove",1,true)
-        or n:find("sleeve",1,true) or n:find("viewmodel",1,true)
+    -- НЕ матчить "handle" (там есть "hand") и не весь viewmodel
+    if n:find("handle", 1, true) then return false end
+    if n:find("handguard", 1, true) or n:find("hand_guard", 1, true) then return false end
+    if n == "viewmodel" or n:find("viewmodel", 1, true) then return false end
+    return n:find("arm", 1, true) or n:find("hand", 1, true) or n:find("glove", 1, true)
+        or n:find("sleeve", 1, true) or n:find("finger", 1, true)
+        or n:find("leftarm", 1, true) or n:find("rightarm", 1, true)
 end
 local function isShieldName(n)
     n = string.lower(n or "")
-    return n:find("shield",1,true) or n:find("riot",1,true) or n:find("ballistic",1,true)
+    return n:find("shield", 1, true) or n:find("riot", 1, true) or n:find("ballistic", 1, true)
+        or n:find("ballisticshield", 1, true)
 end
 
 local function isLens(p)
@@ -255,34 +269,52 @@ local function killSkin(p)
             if p.TextureID ~= "" then p.TextureID = "" end
         end
         for _, ch in ipairs(p:GetChildren()) do
-            if ch:IsA("Decal") or ch:IsA("Texture") then ch.Transparency = 1 end
-            if ch.ClassName == "SurfaceAppearance" then ch:Destroy() end
+            if ch:IsA("Decal") or ch:IsA("Texture") then
+                ch.Transparency = 1
+            end
+            if ch.ClassName == "SurfaceAppearance" then
+                ch:Destroy()
+            end
+            if ch:IsA("SpecialMesh") then
+                pcall(function()
+                    if ch.TextureId and ch.TextureId ~= "" then
+                        ch.TextureId = ""
+                    end
+                end)
+            end
         end
     end)
 end
 
--- OLD glass: LTM + killSkin + white/color, INCLUDING lenses/sights
+-- Glass: LTM + killSkin + color, INCLUDING lenses/sights
 local function applyGlass(p, t, col, colorOn)
     if not p or not p.Parent then return end
     local wash = math.clamp(t * 1.15, 0, 1)
     local base = colorOn and col or Color3.new(1, 1, 1)
     local washed = base:Lerp(Color3.new(1, 1, 1), wash * 0.8)
+    killSkin(p)
+    -- guts: fully invisible
     if isGuts(p) then
         p.LocalTransparencyModifier = 1
-        killSkin(p)
+        pcall(function() p.Transparency = math.max(p.Transparency, 0.99) end)
         return
     end
-    -- sight body + lens: LTM + killSkin + color (no Material force on lens-ish)
+    p.LocalTransparencyModifier = t
+    -- sight/lens: don't force material (can break optics), just LTM + color
     if isSightBody(p) or isLens(p) then
-        p.LocalTransparencyModifier = t
-        killSkin(p)
         p.Color = washed
         return
     end
-    killSkin(p)
-    p.LocalTransparencyModifier = t
     pcall(function() p.Material = Enum.Material.SmoothPlastic end)
     p.Color = washed
+    -- fallback for stubborn meshes: nudge base Transparency slightly when very glassy
+    if t >= 0.85 then
+        pcall(function()
+            if p.Transparency < 0.15 then
+                p.Transparency = 0.15
+            end
+        end)
+    end
 end
 
 local function scan()
@@ -307,7 +339,7 @@ local function scan()
     local function push(p, kind)
         if not p:IsA("BasePart") then return end
         if seen[p] then return end
-        -- prefer shield classification if name matches
+        -- shield only by OWN name / direct parent name (not whole tree)
         if isShieldName(p.Name) or (p.Parent and isShieldName(p.Parent.Name)) then
             kind = "shield"
         end
@@ -322,24 +354,30 @@ local function scan()
     end
     if cam then
         for _, obj in ipairs(cam:GetChildren()) do
-            local isA, isS = armName(obj.Name), isShieldName(obj.Name)
+            -- НЕ помечаем весь объект как arm/shield по имени контейнера —
+            -- только конкретные части (иначе ствол/рукоять уходят в arms)
             for _, p in ipairs(obj:GetDescendants()) do
                 if p:IsA("BasePart") then
-                    if isS or isShieldName(p.Name) then push(p, "shield")
-                    elseif isA or armName(p.Name) then push(p, "arm")
-                    else push(p, "gun") end
+                    if isShieldName(p.Name) or (p.Parent and isShieldName(p.Parent.Name)) then
+                        push(p, "shield")
+                    elseif armName(p.Name) then
+                        push(p, "arm")
+                    else
+                        push(p, "gun")
+                    end
                 end
             end
             if obj:IsA("BasePart") then
-                if isS then push(obj,"shield") elseif isA then push(obj,"arm") else push(obj,"gun") end
+                if isShieldName(obj.Name) then push(obj, "shield")
+                elseif armName(obj.Name) then push(obj, "arm")
+                else push(obj, "gun") end
             end
         end
     end
     -- Do NOT scan Character tools for FP glass (Camera viewmodel only).
-    -- Scanning both Camera + Character caused double shield/gun ghosts.
 end
 
-local function hardRefresh()
+hardRefresh = function()
     scan()
     for _, d in ipairs({0.03, 0.1, 0.25, 0.5, 1.0}) do
         task.delay(d, function() if _G.SH then scan() end end)
@@ -367,7 +405,7 @@ conn(RunService.RenderStepped:Connect(function()
     if S.gunOn or S.gunColorOn then
         for i=1,#guns do
             local p=guns[i]
-            if p and p.Parent and not isGuts(p) then
+            if p and p.Parent then
                 if S.gunOn then
                     applyGlass(p, S.gunT, S.gunCol, S.gunColorOn)
                 else
@@ -424,7 +462,7 @@ conn(Camera.ChildAdded:Connect(function() hardRefresh() end))
 local cc = Instance.new("ColorCorrectionEffect")
 cc.Name, cc.Enabled, cc.Parent = "SH_World", false, Lighting
 SH.cc = cc
-local function applyWorld()
+applyWorld = function()
     if S.worldOn then
         cc.Enabled = true
         cc.TintColor = Color3.new(1,1,1):Lerp(S.worldCol, S.worldTint)
@@ -547,10 +585,10 @@ local savedDisplayName, savedGameUsername, savedRank = "", "", ""
 local namesEnabled, nameColorEnabled = false, false
 local rainbowDisplayEnabled, rainbowUsernameEnabled, rainbowRankEnabled = false, false, false
 local rainbowSpeed = 1
-local slotActive, slotMode = true, "RGB"
+local slotMode = "RGB"
 local slotHighlights = {}
 local RED_S, WHITE_S = Color3.fromRGB(216,30,27), Color3.new(1,1,1)
-local gunHUDActive, gunHUDMode = true, "RGB"
+local gunHUDMode = "RGB"
 
 local function applyNamesToChar(char)
     if savedDisplayName=="" and savedGameUsername=="" and savedRank=="" then return end
@@ -626,7 +664,12 @@ task.delay(1, function()
     end
 end)
 conn(RunService.RenderStepped:Connect(function()
-    if not slotActive then return end
+    if not S.slotRGB then
+        for _, h in ipairs(slotHighlights) do
+            if h.frame then h.frame.Visible = false end
+        end
+        return
+    end
     local color = slotMode=="RGB" and Color3.fromHSV(tick()%6/6,1,1) or nil
     for _, h in ipairs(slotHighlights) do
         if h.frame and h.frame.Parent then
@@ -637,7 +680,7 @@ conn(RunService.RenderStepped:Connect(function()
     end
 end))
 conn(RunService.RenderStepped:Connect(function()
-    if not gunHUDActive then return end
+    if not S.gunHUDRGB then return end
     local gunHUD = PGui:FindFirstChild("StatusUI")
     gunHUD = gunHUD and gunHUD:FindFirstChild("GunHUD")
     if not gunHUD then return end
@@ -762,6 +805,10 @@ local function loadCfg(name)
     end)
     S.cfgName = name
     applyWorld(); hardRefresh()
+    pcall(function()
+        if applyTheme and themeName then applyTheme(themeName) end
+    end)
+    for _, f in ipairs(themePaintFns) do pcall(f) end
     for _, f in ipairs(repaint) do pcall(f) end
     return true
 end
@@ -793,14 +840,36 @@ local function getEl(path)
     for p in path:gmatch("[^%.]+") do o = o and o:FindFirstChild(p); if not o then return nil end end
     return o
 end
+local function isProtectedUI(o)
+    if not o then return true end
+    local n = string.lower(o.Name or "")
+    if n:find("chat", 1, true) or n:find("bubble", 1, true) then return true end
+    if n:find("summerhub", 1, true) or n:find("sh_", 1, true) then return true end
+    -- never touch CoreGui chat systems
+    if o:IsDescendantOf(CoreGui) then
+        local top = o
+        while top.Parent and top.Parent ~= CoreGui do top = top.Parent end
+        local tn = string.lower(top.Name or "")
+        if tn:find("chat", 1, true) or tn == "experiencechat" or tn == "bubblechat" then return true end
+    end
+    return false
+end
 local function hideGameUI()
     savedUI = {}
     for _, path in ipairs(paths) do
-        pcall(function() local o=getEl(path); if o then savedUI[o]=o.Size; o.Size=UDim2.new(0,0,0,0) end end)
+        pcall(function()
+            local o = getEl(path)
+            if o and not isProtectedUI(o) then
+                savedUI[o] = o.Size
+                o.Size = UDim2.new(0, 0, 0, 0)
+            end
+        end)
     end
 end
 local function showGameUI()
-    for o,sz in pairs(savedUI) do pcall(function() o.Size=sz end) end
+    for o, sz in pairs(savedUI) do
+        pcall(function() if o and o.Parent then o.Size = sz end end)
+    end
 end
 
 -- skins compact
@@ -1308,9 +1377,12 @@ gearBtn.Parent = userBar
 Instance.new("UICorner", gearBtn).CornerRadius = UDim.new(0, 7)
 
 -- settings popup (theme / scale / custom)
-local settingsPop = Instance.new("Frame")
-settingsPop.Size, settingsPop.Position = UDim2.new(0, 260, 0, 400), UDim2.new(0, 200, 1, -420)
+local settingsPop = Instance.new("ScrollingFrame")
+settingsPop.Size, settingsPop.Position = UDim2.new(0, 270, 0, 420), UDim2.new(0, 190, 1, -440)
 settingsPop.BackgroundColor3, settingsPop.BorderSizePixel, settingsPop.Visible, settingsPop.ZIndex = T.panel, 0, false, 30
+settingsPop.ScrollBarThickness = 4
+settingsPop.CanvasSize = UDim2.new(0, 0, 0, 720)
+settingsPop.ScrollingDirection = Enum.ScrollingDirection.Y
 settingsPop.Parent = win
 Instance.new("UICorner", settingsPop).CornerRadius = UDim.new(0, 12)
 local setStroke = Instance.new("UIStroke", settingsPop)
@@ -1325,20 +1397,21 @@ gearBtn.MouseButton1Click:Connect(function()
     if settingsPop.Visible then
         TweenService:Create(settingsPop, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
             BackgroundTransparency = 1,
-            Size = UDim2.new(0, 240, 0, 360)
+            Size = UDim2.new(0, 250, 0, 380)
         }):Play()
         task.delay(0.18, function()
             settingsPop.Visible = false
             settingsPop.BackgroundTransparency = 0
-            settingsPop.Size = UDim2.new(0, 260, 0, 400)
+            settingsPop.Size = UDim2.new(0, 270, 0, 420)
+            closeColorPicker()
         end)
     else
         settingsPop.Visible = true
         settingsPop.BackgroundTransparency = 1
-        settingsPop.Size = UDim2.new(0, 240, 0, 360)
+        settingsPop.Size = UDim2.new(0, 250, 0, 380)
         TweenService:Create(settingsPop, TweenInfo.new(0.22, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
             BackgroundTransparency = 0,
-            Size = UDim2.new(0, 260, 0, 400)
+            Size = UDim2.new(0, 270, 0, 420)
         }):Play()
     end
 end)
@@ -1348,9 +1421,11 @@ local content = Instance.new("Frame")
 content.Size, content.Position = UDim2.new(1, -206, 1, -56), UDim2.new(0, 198, 0, 48)
 content.BackgroundTransparency, content.Parent = 1, win
 
-local pages, tabBtns, repaint, themePaintFns = {}, {}, {}, {}
+-- pages/tabBtns/repaint/themePaintFns already forward-declared
 local currentPage = "Visuals"
 local visSub = "Glass" -- Glass | Tracers | World
+local SH_sliderDrag = false
+local colorPickerGui, colorPickerFrame = nil, nil
 
 local function showPage(name)
     currentPage = name
@@ -1399,12 +1474,13 @@ local function showPage(name)
     for _, f in ipairs(repaint) do pcall(f) end
 end
 
--- tabs: Visuals (with sub), Skins, Player, Main — Tracers/World as sub of Visuals
+-- tabs: Visuals (with sub), Skins, Player, Main, Updates
 local tabOrder = {
     {name="Visuals", icon="◈"},
     {name="Skins", icon="◇"},
     {name="Player", icon="○"},
     {name="Main", icon="▣"},
+    {name="Updates", icon="★"},
 }
 
 for _, td in ipairs(tabOrder) do
@@ -1472,19 +1548,59 @@ local function setVisSubsOpen(open)
     -- no-op (subs are always visible on Visuals page)
 end
 
--- drag
+-- drag window from anywhere except interactive controls (sliders / textboxes / color picker)
 do
-    local drag,d0,p0=false,nil,nil
-    logoWrap.InputBegan:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 then drag,d0,p0=true,i.Position,win.Position end
+    local drag, d0, p0 = false, nil, nil
+    local function isNoDrag(obj)
+        if not obj then return false end
+        local cur = obj
+        for _ = 1, 12 do
+            if not cur or cur == win or cur == gui then break end
+            local n = string.lower(cur.Name or "")
+            if cur:IsA("TextBox") then return true end
+            if cur:IsA("TextButton") and (n:find("knob") or n:find("track") or n:find("slider")) then return true end
+            if n == "sh_track" or n == "sh_knob" or n == "sh_slider" then return true end
+            if colorPickerGui and cur:IsDescendantOf(colorPickerGui) then return true end
+            if settingsPop and cur:IsDescendantOf(settingsPop) and cur:IsA("TextButton") then return true end
+            cur = cur.Parent
+        end
+        return false
+    end
+    -- mark slider parts
+    -- (mkSlider will name track/knob)
+    win.InputBegan:Connect(function(i)
+        if i.UserInputType ~= Enum.UserInputType.MouseButton1 and i.UserInputType ~= Enum.UserInputType.Touch then return end
+        if SH_sliderDrag then return end
+        if colorPickerFrame then return end
+        -- if click is on a TextButton that is a real button (not empty panel), skip — except we still want drag on empty areas
+        -- Roblox: InputBegan on win fires only if win itself is hit; children sink. So also hook topBar/sidebar.
+        drag, d0, p0 = true, i.Position, win.Position
     end)
-    logoWrap.InputEnded:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=false end
+    local function bindDragSurface(surf)
+        if not surf then return end
+        surf.InputBegan:Connect(function(i)
+            if i.UserInputType ~= Enum.UserInputType.MouseButton1 and i.UserInputType ~= Enum.UserInputType.Touch then return end
+            if SH_sliderDrag or colorPickerFrame then return end
+            drag, d0, p0 = true, i.Position, win.Position
+        end)
+    end
+    bindDragSurface(logoWrap)
+    bindDragSurface(sidebar)
+    bindDragSurface(userBar)
+    if topBar then bindDragSurface(topBar) end
+    -- content empty space: pages are ScrollingFrames — drag from page background
+    for _, pg in pairs(pages) do
+        bindDragSurface(pg)
+    end
+    UIS.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            drag = false
+        end
     end)
     UIS.InputChanged:Connect(function(i)
-        if drag and i.UserInputType==Enum.UserInputType.MouseMovement then
-            local d=i.Position-d0
-            win.Position=UDim2.new(p0.X.Scale,p0.X.Offset+d.X,p0.Y.Scale,p0.Y.Offset+d.Y)
+        if drag and not SH_sliderDrag and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - d0
+            win.Position = UDim2.new(p0.X.Scale, p0.X.Offset + d.X, p0.Y.Scale, p0.Y.Offset + d.Y)
         end
     end)
 end
@@ -1548,6 +1664,7 @@ local function mkSlider(parent, y, label, min, max, dec, get, set)
     vlab.Font, vlab.TextSize, vlab.TextColor3 = Enum.Font.GothamBold, 12, T.text
     vlab.TextXAlignment, vlab.Parent = Enum.TextXAlignment.Right, wrap
     local track = Instance.new("Frame")
+    track.Name = "SH_Track"
     track.Size, track.Position = UDim2.new(1,0,0,5), UDim2.new(0,0,0,24)
     track.BackgroundColor3, track.BorderSizePixel, track.Parent = T.track, 0, wrap
     Instance.new("UICorner", track).CornerRadius = UDim.new(1,0)
@@ -1555,6 +1672,7 @@ local function mkSlider(parent, y, label, min, max, dec, get, set)
     fill.BackgroundColor3, fill.BorderSizePixel, fill.Parent = T.fill, 0, track
     Instance.new("UICorner", fill).CornerRadius = UDim.new(1,0)
     local knob = Instance.new("TextButton")
+    knob.Name = "SH_Knob"
     knob.Size, knob.BackgroundColor3, knob.Text, knob.BorderSizePixel = UDim2.new(0,12,0,12), Color3.new(1,1,1), "", 0
     knob.ZIndex, knob.Parent = 2, track
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1,0)
@@ -1575,13 +1693,22 @@ local function mkSlider(parent, y, label, min, max, dec, get, set)
         set(val); paint(); applyWorld()
     end
     paint()
-    knob.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=true end end)
-    track.InputBegan:Connect(function(i)
+    knob.InputBegan:Connect(function(i)
         if i.UserInputType==Enum.UserInputType.MouseButton1 then
-            setF((i.Position.X-track.AbsolutePosition.X)/math.max(track.AbsoluteSize.X,1)); drag=true
+            drag=true; SH_sliderDrag=true
         end
     end)
-    UIS.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=false end end)
+    track.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then
+            setF((i.Position.X-track.AbsolutePosition.X)/math.max(track.AbsoluteSize.X,1))
+            drag=true; SH_sliderDrag=true
+        end
+    end)
+    UIS.InputEnded:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then
+            drag=false; SH_sliderDrag=false
+        end
+    end)
     UIS.InputChanged:Connect(function(i)
         if drag and i.UserInputType==Enum.UserInputType.MouseMovement then
             setF((i.Position.X-track.AbsolutePosition.X)/math.max(track.AbsoluteSize.X,1))
@@ -1605,6 +1732,270 @@ local function mkBtn(parent, y, text, fn)
     return b
 end
 
+-- Shared HSV color picker (SV square + hue bar + value bar)
+local function closeColorPicker()
+    if colorPickerGui then
+        pcall(function() colorPickerGui:Destroy() end)
+    end
+    colorPickerGui = nil
+    colorPickerFrame = nil
+end
+
+local function openColorPicker(anchorBtn, get, set, onChanged)
+    closeColorPicker()
+    local cur = get() or Color3.new(1, 1, 1)
+    local h, s, v = Color3.toHSV(cur)
+    if h ~= h then h = 0 end -- NaN guard
+    if s ~= s then s = 1 end
+    if v ~= v then v = 1 end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "SH_ColorPickerGui"
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = 10000010
+    sg.IgnoreGuiInset = true
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    pcall(function() sg.Parent = CoreGui end)
+    if not sg.Parent then sg.Parent = PGui end
+    colorPickerGui = sg
+
+    local root = Instance.new("Frame")
+    root.Name = "SH_ColorPicker"
+    root.Size = UDim2.new(0, 210, 0, 268)
+    root.BackgroundColor3 = Color3.fromRGB(24, 24, 32)
+    root.BorderSizePixel = 0
+    root.Active = true
+    root.Parent = sg
+    Instance.new("UICorner", root).CornerRadius = UDim.new(0, 10)
+    local stroke = Instance.new("UIStroke", root)
+    stroke.Color = Color3.fromRGB(80, 80, 110)
+    stroke.Thickness = 1
+    colorPickerFrame = root
+
+    local abs = anchorBtn.AbsolutePosition
+    local asz = anchorBtn.AbsoluteSize
+    local x = abs.X
+    local y = abs.Y + asz.Y + 8
+    local cam = workspace.CurrentCamera
+    local vs = cam and cam.ViewportSize or Vector2.new(1280, 720)
+    if x + 210 > vs.X then x = math.max(8, vs.X - 218) end
+    if y + 268 > vs.Y then y = math.max(8, abs.Y - 276) end
+    root.Position = UDim2.new(0, x, 0, y)
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -36, 0, 22)
+    title.Position = UDim2.new(0, 10, 0, 4)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 13
+    title.TextColor3 = Color3.fromRGB(220, 220, 235)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Text = "Color Picker"
+    title.Parent = root
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0, 24, 0, 22)
+    closeBtn.Position = UDim2.new(1, -28, 0, 4)
+    closeBtn.BackgroundTransparency = 1
+    closeBtn.Text = "✕"
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 14
+    closeBtn.TextColor3 = Color3.fromRGB(180, 180, 200)
+    closeBtn.Parent = root
+    closeBtn.MouseButton1Click:Connect(closeColorPicker)
+
+    -- SV square (hue base + white + black overlays)
+    local sq = Instance.new("TextButton")
+    sq.Size = UDim2.new(0, 186, 0, 140)
+    sq.Position = UDim2.new(0, 12, 0, 30)
+    sq.BorderSizePixel = 0
+    sq.Text = ""
+    sq.AutoButtonColor = false
+    sq.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
+    sq.Parent = root
+    Instance.new("UICorner", sq).CornerRadius = UDim.new(0, 6)
+
+    local whiteLayer = Instance.new("Frame")
+    whiteLayer.Size = UDim2.new(1, 0, 1, 0)
+    whiteLayer.BackgroundColor3 = Color3.new(1, 1, 1)
+    whiteLayer.BorderSizePixel = 0
+    whiteLayer.Active = false
+    whiteLayer.Parent = sq
+    Instance.new("UICorner", whiteLayer).CornerRadius = UDim.new(0, 6)
+    local wg = Instance.new("UIGradient")
+    wg.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+    wg.Parent = whiteLayer
+
+    local blackLayer = Instance.new("Frame")
+    blackLayer.Size = UDim2.new(1, 0, 1, 0)
+    blackLayer.BackgroundColor3 = Color3.new(0, 0, 0)
+    blackLayer.BorderSizePixel = 0
+    blackLayer.Active = false
+    blackLayer.Parent = sq
+    Instance.new("UICorner", blackLayer).CornerRadius = UDim.new(0, 6)
+    local bg = Instance.new("UIGradient")
+    bg.Rotation = 90
+    bg.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1),
+        NumberSequenceKeypoint.new(1, 0),
+    })
+    bg.Parent = blackLayer
+
+    local cursor = Instance.new("Frame")
+    cursor.Size = UDim2.new(0, 12, 0, 12)
+    cursor.AnchorPoint = Vector2.new(0.5, 0.5)
+    cursor.Position = UDim2.new(s, 0, 1 - v, 0)
+    cursor.BackgroundColor3 = Color3.new(1, 1, 1)
+    cursor.BorderSizePixel = 0
+    cursor.Active = false
+    cursor.Parent = sq
+    Instance.new("UICorner", cursor).CornerRadius = UDim.new(1, 0)
+    local cStroke = Instance.new("UIStroke", cursor)
+    cStroke.Color = Color3.new(0, 0, 0)
+    cStroke.Thickness = 1.5
+
+    -- Hue rainbow bar
+    local hBar = Instance.new("TextButton")
+    hBar.Size = UDim2.new(0, 186, 0, 14)
+    hBar.Position = UDim2.new(0, 12, 0, 178)
+    hBar.BorderSizePixel = 0
+    hBar.Text = ""
+    hBar.AutoButtonColor = false
+    hBar.BackgroundColor3 = Color3.new(1, 1, 1)
+    hBar.Parent = root
+    Instance.new("UICorner", hBar).CornerRadius = UDim.new(0, 4)
+    local hGrad = Instance.new("UIGradient")
+    hGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromHSV(0, 1, 1)),
+        ColorSequenceKeypoint.new(0.17, Color3.fromHSV(0.17, 1, 1)),
+        ColorSequenceKeypoint.new(0.33, Color3.fromHSV(0.33, 1, 1)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromHSV(0.5, 1, 1)),
+        ColorSequenceKeypoint.new(0.67, Color3.fromHSV(0.67, 1, 1)),
+        ColorSequenceKeypoint.new(0.83, Color3.fromHSV(0.83, 1, 1)),
+        ColorSequenceKeypoint.new(1, Color3.fromHSV(1, 1, 1)),
+    })
+    hGrad.Parent = hBar
+    local hCursor = Instance.new("Frame")
+    hCursor.Size = UDim2.new(0, 4, 1, 4)
+    hCursor.AnchorPoint = Vector2.new(0.5, 0.5)
+    hCursor.Position = UDim2.new(h, 0, 0.5, 0)
+    hCursor.BackgroundColor3 = Color3.new(1, 1, 1)
+    hCursor.BorderSizePixel = 0
+    hCursor.Active = false
+    hCursor.Parent = hBar
+    Instance.new("UICorner", hCursor).CornerRadius = UDim.new(0, 2)
+
+    -- Value / darkness bar
+    local vBar = Instance.new("TextButton")
+    vBar.Size = UDim2.new(0, 186, 0, 14)
+    vBar.Position = UDim2.new(0, 12, 0, 200)
+    vBar.BorderSizePixel = 0
+    vBar.Text = ""
+    vBar.AutoButtonColor = false
+    vBar.BackgroundColor3 = Color3.new(1, 1, 1)
+    vBar.Parent = root
+    Instance.new("UICorner", vBar).CornerRadius = UDim.new(0, 4)
+    local vGrad = Instance.new("UIGradient")
+    vGrad.Color = ColorSequence.new(Color3.new(0, 0, 0), Color3.fromHSV(h, s, 1))
+    vGrad.Parent = vBar
+    local vCursor = Instance.new("Frame")
+    vCursor.Size = UDim2.new(0, 4, 1, 4)
+    vCursor.AnchorPoint = Vector2.new(0.5, 0.5)
+    vCursor.Position = UDim2.new(v, 0, 0.5, 0)
+    vCursor.BackgroundColor3 = Color3.new(1, 1, 1)
+    vCursor.BorderSizePixel = 0
+    vCursor.Active = false
+    vCursor.Parent = vBar
+    Instance.new("UICorner", vCursor).CornerRadius = UDim.new(0, 2)
+
+    local preview = Instance.new("Frame")
+    preview.Size = UDim2.new(0, 186, 0, 28)
+    preview.Position = UDim2.new(0, 12, 0, 224)
+    preview.BackgroundColor3 = cur
+    preview.BorderSizePixel = 0
+    preview.Parent = root
+    Instance.new("UICorner", preview).CornerRadius = UDim.new(0, 6)
+
+    local function apply(nh, ns, nv)
+        h = math.clamp(nh, 0, 1)
+        s = math.clamp(ns, 0, 1)
+        v = math.clamp(nv, 0, 1)
+        local col = Color3.fromHSV(h, s, v)
+        sq.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
+        vGrad.Color = ColorSequence.new(Color3.new(0, 0, 0), Color3.fromHSV(h, s, 1))
+        cursor.Position = UDim2.new(s, 0, 1 - v, 0)
+        hCursor.Position = UDim2.new(h, 0, 0.5, 0)
+        vCursor.Position = UDim2.new(v, 0, 0.5, 0)
+        preview.BackgroundColor3 = col
+        pcall(function() set(col) end)
+        if anchorBtn and anchorBtn.Parent then
+            anchorBtn.BackgroundColor3 = col
+        end
+        if onChanged then pcall(onChanged, col) end
+        -- live theme paint when editing custom colors
+        if themeName == "Custom" then
+            for k, vv in pairs(Themes.Custom) do T[k] = vv end
+            for _, f in ipairs(themePaintFns) do pcall(f) end
+            pcall(function()
+                win.BackgroundColor3 = T.bg
+                sidebar.BackgroundColor3 = T.sidebar
+            end)
+        end
+    end
+
+    local mode = nil -- "sv" | "h" | "v"
+    local function posOn(btn, input)
+        local rel = Vector2.new(input.Position.X, input.Position.Y) - btn.AbsolutePosition
+        local px = math.clamp(rel.X / math.max(btn.AbsoluteSize.X, 1), 0, 1)
+        local py = math.clamp(rel.Y / math.max(btn.AbsoluteSize.Y, 1), 0, 1)
+        return px, py
+    end
+
+    local function handle(input)
+        if mode == "sv" then
+            local px, py = posOn(sq, input)
+            apply(h, px, 1 - py)
+        elseif mode == "h" then
+            local px = posOn(hBar, input)
+            apply(px, s, v)
+        elseif mode == "v" then
+            local px = posOn(vBar, input)
+            apply(h, s, px)
+        end
+    end
+
+    sq.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            mode = "sv"; handle(input)
+        end
+    end)
+    hBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            mode = "h"; handle(input)
+        end
+    end)
+    vBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            mode = "v"; handle(input)
+        end
+    end)
+
+    conn(UIS.InputChanged:Connect(function(input)
+        if not colorPickerGui or not mode then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            handle(input)
+        end
+    end))
+    conn(UIS.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            mode = nil
+        end
+    end))
+end
+
 local function mkColorBtn(parent, y, label, get, set)
     local row = Instance.new("Frame")
     row.Size, row.Position, row.BackgroundTransparency = UDim2.new(1,-20,0,28), UDim2.new(0,10,0,y), 1
@@ -1619,51 +2010,58 @@ local function mkColorBtn(parent, y, label, get, set)
     b.TextColor3, b.TextXAlignment, b.BackgroundColor3 = T.text, Enum.TextXAlignment.Left, get()
     b.BorderSizePixel, b.Parent = 0, row
     Instance.new("UICorner", b).CornerRadius = UDim.new(0,6)
-    local presets = {
-        Color3.fromRGB(255,255,255), Color3.fromRGB(255,40,40), Color3.fromRGB(255,140,40),
-        Color3.fromRGB(255,220,40), Color3.fromRGB(50,255,90), Color3.fromRGB(40,200,255),
-        Color3.fromRGB(90,90,255), Color3.fromRGB(200,50,255), Color3.fromRGB(255,80,160),
-    }
     b.MouseButton1Click:Connect(function()
-        local cur=get(); local idx=1
-        for i,c in ipairs(presets) do
-            if math.abs(c.R-cur.R)+math.abs(c.G-cur.G)+math.abs(c.B-cur.B)<0.05 then idx=i%#presets+1 break end
-        end
-        set(presets[idx]); b.BackgroundColor3=presets[idx]; hardRefresh()
+        openColorPicker(b, get, set, function()
+            hardRefresh()
+        end)
     end)
-    return function() b.BackgroundColor3=get() end
+    return function() b.BackgroundColor3 = get() end
 end
 
-local function applyTheme(name)
+applyTheme = function(name)
     if not Themes[name] then return end
     themeName = name
     for k,v in pairs(Themes[name]) do T[k]=v end
-    win.BackgroundColor3=T.bg
-    sidebar.BackgroundColor3=T.sidebar
-    winStroke.Color=T.stroke
-    logoWrap.BackgroundColor3=T.card
-    logoAccent.BackgroundColor3=T.accent
-    logo.TextColor3=T.accent2
-    if logoSub then logoSub.TextColor3=T.dim end
-    if logoStroke then logoStroke.Color=T.accent end
-    if logoGrad then logoGrad.Color = ColorSequence.new(T.card, T.panel) end
-    userBar.BackgroundColor3=T.card
-    userLbl.TextColor3=T.text
-    uidLbl.TextColor3=T.dim
-    gearBtn.TextColor3=T.dim
-    gearBtn.BackgroundColor3=T.panel
-    avatar.BackgroundColor3=T.panel
-    settingsPop.BackgroundColor3=T.panel
-    setStroke.Color=T.stroke
-    setTitle.TextColor3=T.accent2
-    cfgDrop.BackgroundColor3=T.card
-    cfgDrop.TextColor3=T.text
-    if cfgDropStroke then cfgDropStroke.Color=T.stroke end
-    wm1s.Color=T.accent
-    wm2s.Color=T.accent
-    badge.BackgroundColor3=T.accent
+    pcall(function()
+        win.BackgroundColor3=T.bg
+        sidebar.BackgroundColor3=T.sidebar
+        winStroke.Color=T.stroke
+        logoWrap.BackgroundColor3=T.card
+        logoAccent.BackgroundColor3=T.accent
+        logo.TextColor3=T.accent2
+        if logoSub then logoSub.TextColor3=T.dim end
+        if logoStroke then logoStroke.Color=T.accent end
+        if logoGrad then logoGrad.Color = ColorSequence.new(T.card, T.panel) end
+        userBar.BackgroundColor3=T.card
+        userLbl.TextColor3=T.text
+        uidLbl.TextColor3=T.dim
+        gearBtn.TextColor3=T.dim
+        gearBtn.BackgroundColor3=T.panel
+        avatar.BackgroundColor3=T.panel
+        settingsPop.BackgroundColor3=T.panel
+        setStroke.Color=T.stroke
+        setTitle.TextColor3=T.accent2
+        cfgDrop.BackgroundColor3=T.card
+        cfgDrop.TextColor3=T.text
+        if cfgDropStroke then cfgDropStroke.Color=T.stroke end
+        wm1s.Color=T.accent
+        wm2s.Color=T.accent
+        badge.BackgroundColor3=T.accent
+        for n, pg in pairs(pages) do
+            if pg:IsA("ScrollingFrame") then
+                pg.ScrollBarImageColor3 = T.accent
+            end
+        end
+        for n, b in pairs(tabBtns) do
+            local active = (n == currentPage)
+            b.BackgroundColor3 = T.card
+            b.TextColor3 = active and T.accent2 or T.dim
+            local ind = b:FindFirstChild("Ind")
+            if ind then ind.BackgroundColor3 = T.accent end
+        end
+    end)
     for _,f in ipairs(themePaintFns) do pcall(f) end
-    showPage(currentPage)
+    for _, f in ipairs(repaint) do pcall(f) end
 end
 
 -- SETTINGS POP content
@@ -1685,6 +2083,52 @@ do
         b.MouseButton1Click:Connect(function() applyTheme(tn) end)
         y = y + 30
     end
+    y = y + 4
+    local labC = Instance.new("TextLabel")
+    labC.Size, labC.Position = UDim2.new(1,-20,0,16), UDim2.new(0,10,0,y)
+    labC.BackgroundTransparency, labC.Font, labC.TextSize = 1, Enum.Font.GothamBold, 11
+    labC.TextColor3, labC.TextXAlignment, labC.Text = T.dim, Enum.TextXAlignment.Left, "CUSTOM COLORS"
+    labC.ZIndex, labC.Parent = 31, settingsPop
+    y = y + 18
+    local function mkCustomColor(key, label)
+        local row = Instance.new("Frame")
+        row.Size, row.Position, row.BackgroundTransparency = UDim2.new(1,-20,0,24), UDim2.new(0,10,0,y), 1
+        row.ZIndex, row.Parent = 31, settingsPop
+        local l = Instance.new("TextLabel")
+        l.Size, l.BackgroundTransparency = UDim2.new(0.55,0,1,0), 1
+        l.Font, l.TextSize, l.TextColor3 = Enum.Font.Gotham, 12, T.text
+        l.TextXAlignment, l.Text, l.ZIndex, l.Parent = Enum.TextXAlignment.Left, label, 32, row
+        local b = Instance.new("TextButton")
+        b.Size, b.Position = UDim2.new(0,80,0,20), UDim2.new(1,-80,0.5,-10)
+        b.Text, b.Font, b.TextSize = "  Edit", Enum.Font.GothamBold, 11
+        b.TextColor3, b.TextXAlignment = T.text, Enum.TextXAlignment.Left
+        b.BackgroundColor3 = Themes.Custom[key] or Color3.new(1,1,1)
+        b.BorderSizePixel, b.ZIndex, b.Parent = 0, 32, row
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0,5)
+        b.MouseButton1Click:Connect(function()
+            openColorPicker(b, function() return Themes.Custom[key] end, function(c)
+                Themes.Custom[key] = c
+                b.BackgroundColor3 = c
+                if themeName == "Custom" then
+                    applyTheme("Custom")
+                else
+                    -- auto-switch to Custom so changes are visible
+                    applyTheme("Custom")
+                end
+            end)
+        end)
+        themePaintFns[#themePaintFns+1] = function()
+            b.BackgroundColor3 = Themes.Custom[key] or b.BackgroundColor3
+            l.TextColor3 = T.text
+        end
+        y = y + 26
+    end
+    mkCustomColor("accent", "Accent")
+    mkCustomColor("accent2", "Accent 2")
+    mkCustomColor("bg", "Background")
+    mkCustomColor("panel", "Panel")
+    mkCustomColor("card", "Card")
+    mkCustomColor("text", "Text")
     y = y + 6
     local lab2 = Instance.new("TextLabel")
     lab2.Size, lab2.Position = UDim2.new(1,-20,0,16), UDim2.new(0,10,0,y)
@@ -1962,10 +2406,11 @@ do
     repaint[#repaint+1]=mkToggle(colCard,64,"Rainbow Display",function() return rainbowDisplayEnabled end,function(v) rainbowDisplayEnabled=v end)
     repaint[#repaint+1]=mkToggle(colCard,96,"Rainbow Username",function() return rainbowUsernameEnabled end,function(v) rainbowUsernameEnabled=v end)
     local hudCard = section(p, "HUD / TP", 416, 0, 250, 220)
-    repaint[#repaint+1]=mkToggle(hudCard,32,"RGB Slots",function() return slotActive end,function(v)
-        slotActive=v; if not v then for _,h in ipairs(slotHighlights) do if h.frame then h.frame.Visible=false end end end
+    repaint[#repaint+1]=mkToggle(hudCard,32,"RGB Slots",function() return S.slotRGB end,function(v)
+        S.slotRGB=v
+        if not v then for _,h in ipairs(slotHighlights) do if h.frame then h.frame.Visible=false end end end
     end)
-    repaint[#repaint+1]=mkToggle(hudCard,64,"GunHUD RGB",function() return gunHUDActive end,function(v) gunHUDActive=v end)
+    repaint[#repaint+1]=mkToggle(hudCard,64,"GunHUD RGB",function() return S.gunHUDRGB end,function(v) S.gunHUDRGB=v end)
     mkBtn(hudCard, 100, "TP1  ]", function()
         local r=LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
         if r then r.CFrame=CFrame.new(4041,1485,5620) end
@@ -2037,6 +2482,42 @@ do
             hideKeyLbl.Text="Hide: "..tostring(inp.KeyCode):gsub("Enum.KeyCode.",""); hideKeyLbl.TextColor3=T.dim
         end
     end))
+end
+
+-- UPDATES tab
+do
+    local p = pages.Updates
+    if p then
+        p.CanvasSize = UDim2.new(0, 0, 0, 520)
+        local card = section(p, "Changelog", 0, 0, 656, 480)
+        local body = Instance.new("TextLabel")
+        body.Size = UDim2.new(1, -24, 1, -40)
+        body.Position = UDim2.new(0, 12, 0, 32)
+        body.BackgroundTransparency = 1
+        body.Font = Enum.Font.Gotham
+        body.TextSize = 13
+        body.TextColor3 = T.text
+        body.TextXAlignment = Enum.TextXAlignment.Left
+        body.TextYAlignment = Enum.TextYAlignment.Top
+        body.TextWrapped = true
+        body.Text = table.concat({
+            "• Bug fixes",
+            "• Glass: full weapon transparency, fixed arm/shield classification",
+            "• Color picker: HSV square + hue + brightness",
+            "• Custom theme colors work live",
+            "• Config saves RGB Slots / GunHUD RGB",
+            "• Settings/theme apply instantly (no tab switch needed)",
+            "• Hide game HUD no longer kills chat",
+            "• Drag menu from anywhere (except sliders)",
+            "• UID registers username instead of Roblox UserId",
+            "",
+            "Summer Hub — stay updated",
+        }, "\n")
+        body.Parent = card
+        themePaintFns[#themePaintFns + 1] = function()
+            body.TextColor3 = T.text
+        end
+    end
 end
 
 showPage("Visuals")
